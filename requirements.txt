@@ -1,3 +1,6 @@
+# also requires ffmpeg, sox
 typer
 requests
 openai
+audiosegment
+pydub

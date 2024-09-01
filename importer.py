@@ -1,8 +1,13 @@
-import sqlite3
-import typer
+import audiosegment
+import os
+from openai import OpenAI
 from pathlib import Path
+from pydub import AudioSegment
 import requests
 import shutil
+import sqlite3
+import sys
+import typer
 from urllib.parse import urlparse, unquote
 
 app = typer.Typer()
@@ -37,6 +42,40 @@ def download_image(url, path):
     with open(path, 'wb') as out_file:
         for chunk in response.iter_content(chunk_size=1024):
             out_file.write(chunk)
+
+def segment_on_voice(file_path: Path, target_duration=20*60*1000):  # 20 minutes in milliseconds
+    audio = AudioSegment.from_mp3(file_path)
+    seg = audiosegment.from_file(file_path).resample(sample_rate_Hz=32000, sample_width=2, channels=1)
+
+    # Detect voice sections (returns a list of tuples with start and end times in milliseconds)
+    voice_segments = seg.detect_voice()
+    speaking_pairs = [voice_segments[i:i+2] for i in range(0, len(voice_segments), 2)]
+
+    current_segment = AudioSegment.silent(duration=0)
+    cursor = 0
+    segments = []
+
+    for pair in speaking_pairs:
+        chunk = pair[0][1] + pair[1][1] if len(pair) == 2 else pair[0][1] # combine the AudioSegments in the pair
+
+        # Check if adding speaking and silence from the pair would exceed the target duration
+        if len(current_segment) + len(chunk) > target_duration:
+            # Save the current segment
+            segments.append(current_segment)
+            current_segment = AudioSegment.silent(duration=0)
+
+        # Add the section of the original audio that corresponds to the resampled chunk
+        slice = audio[cursor:cursor+len(chunk)]
+        current_segment = current_segment + slice
+        cursor += len(chunk)
+
+    # Add the last segment
+    if len(current_segment) > 0:
+        segments.append(current_segment)
+
+    # Export segments
+    for i, segment in enumerate(segments):
+        segment.export(file_path.parent / f'{file_path.stem}_{i+1}.mp3', format="mp3")
 
 @app.command()
 def navigate_podcasts(db_path: str = typer.Argument(DEFAULT_DB_PATH, help="Path to the Apple Podcasts SQLite database")):
@@ -84,9 +123,6 @@ def navigate_podcasts(db_path: str = typer.Argument(DEFAULT_DB_PATH, help="Path 
         episode_artwork_template_url,
     ) = episodes[episode_choice - 1]
 
-    show_artwork_url = show_artwork_template_url.format(w=600, h=600, f="png")
-    episode_artwork_url = episode_artwork_template_url.format(w=600, h=600, f="png")
-
     typer.echo(f'{show_name} / {episode_name}')
 
     show_dir = Path.cwd() / 'assets' / show_name
@@ -95,10 +131,19 @@ def navigate_podcasts(db_path: str = typer.Argument(DEFAULT_DB_PATH, help="Path 
     episode_dir.mkdir(parents=True, exist_ok=True)
 
     episode_path = Path(unquote(urlparse(episode_asset_url).path))
+    episode_dst = episode_dir / f'{episode_name}{episode_path.suffix}'
 
-    shutil.copy(episode_path, episode_dir / f'{episode_name}{episode_path.suffix}')
-    download_image(show_artwork_url, show_dir / f'{show_name}.png')
-    download_image(episode_artwork_url, episode_dir / f'{episode_name}.png')
+    shutil.copy(episode_path, episode_dst)
+
+    if show_artwork_template_url:
+        show_artwork_url = show_artwork_template_url.format(w=600, h=600, f="png")
+        download_image(show_artwork_url, show_dir / f'{show_name}.png')
+    if episode_artwork_template_url:
+        episode_artwork_url = episode_artwork_template_url.format(w=600, h=600, f="png")
+        download_image(episode_artwork_url, episode_dir / f'{episode_name}.png')
+
+    print('Segmenting audio...')
+    segment_on_voice(episode_dst)
 
 if __name__ == "__main__":
     app()
